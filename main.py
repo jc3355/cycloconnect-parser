@@ -1,90 +1,88 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from decimal import Decimal, ROUND_HALF_UP
+from fastapi import FastAPI, UploadFile, File
+from decimal import Decimal
 import pdfplumber
 import re
 
 app = FastAPI()
 
-def fr_to_decimal(value):
-    if value is None:
+def fr_to_decimal(value: str | None) -> Decimal:
+    if not value:
         return Decimal("0")
     value = value.replace("\xa0", "").replace("€", "").replace(" ", "")
     value = value.replace(",", ".")
     return Decimal(value)
 
-def round2(x):
-    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-def find_amount_required(pattern: str, text: str, label: str) -> Decimal:
+def extract_first(pattern: str, text: str) -> str | None:
     m = re.search(pattern, text, flags=re.IGNORECASE)
-    if not m:
-        raise HTTPException(status_code=400, detail=f"Impossible de trouver '{label}' dans le PDF.")
-    return fr_to_decimal(m.group(1))
+    return m.group(1).strip() if m else None
 
-def find_amount_optional(pattern: str, text: str) -> Decimal:
-    m = re.search(pattern, text, flags=re.IGNORECASE)
-    if not m:
-        return Decimal("0")
-    return fr_to_decimal(m.group(1))
-
-def find_amount_any(patterns, text: str, label: str) -> Decimal:
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            return fr_to_decimal(m.group(1))
-    raise HTTPException(status_code=400, detail=f"Impossible de trouver '{label}' dans le PDF.")
+def extract_commande_id(text: str) -> str | None:
+    """
+    Extrait un id du type Lae-46059-1 / Mor-45800-1 etc.
+    On cherche dans tout le texte PDF.
+    """
+    m = re.search(r"\b([A-Za-z]{3}-\d{5}-\d)\b", text)
+    return m.group(1) if m else None
 
 @app.post("/parse")
 async def parse_pdf(file: UploadFile = File(...)):
-
+    # 1) Extraire le texte
     with pdfplumber.open(file.file) as pdf:
-        text = ""
+        parts = []
         for page in pdf.pages:
-            text += page.extract_text() + "\n"
+            t = page.extract_text() or ""
+            parts.append(t)
+    text = "\n".join(parts)
 
-    # 🔎 TOTAL HT (plusieurs formats possibles)
-    total_ht = find_amount_any([
-        r"Total\s*HT\s*après\s*prestations\s*offertes[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-        r"Total\s*HT[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-    ], text, "Total HT")
+    # 2) Extraire commande_id
+    commande_id = extract_commande_id(text)
 
-    # 🔎 TVA (plusieurs formats possibles)
-    total_tva = find_amount_any([
-        r"Montant\s*total\s*de\s*la\s*TVA[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-        r"TVA[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-    ], text, "TVA")
+    # 3) Totaux
+    total_ht_raw  = extract_first(r"Total\s*HT\s+([\d\s,]+)", text)
+    total_tva_raw = extract_first(r"\bTVA\b\s+([\d\s,]+)", text)
+    total_ttc_raw = extract_first(r"Total\s*TTC\s+([\d\s,]+)", text)
 
-    # 🔎 TOTAL TTC (plusieurs formats possibles)
-    total_ttc = find_amount_any([
-        r"Total\s*TTC\s*à\s*payer[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-        r"Total\s*TTC[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-    ], text, "Total TTC")
+    # Frais de service (optionnel)
+    frais_service_raw = extract_first(r"Frais\s*de\s*service\s+([\d\s,]+)", text)
 
-    # 🔎 FRAIS DE SERVICE (optionnel)
-    frais_service = find_amount_optional(
-        r"Frais\s*de\s*service[^0-9]*([0-9][0-9\s\xa0]*,[0-9]{2})\s*€?",
-        text
-    )
+    if not total_ht_raw or not total_tva_raw or not total_ttc_raw:
+        # Debug utile si jamais un PDF a un format différent
+        return {
+            "ok": False,
+            "error_status": 400,
+            "error_body": {
+                "detail": "Impossible de trouver Total HT / TVA / Total TTC dans le PDF."
+            },
+            "debug_excerpt": text[:2500],
+        }
 
-    # 🧮 Calculs
-    prestations = total_ht - frais_service
+    total_ht = fr_to_decimal(total_ht_raw)
+    total_tva = fr_to_decimal(total_tva_raw)
+    total_ttc = fr_to_decimal(total_ttc_raw)
+    frais_service_ht = fr_to_decimal(frais_service_raw)  # 0 si absent
 
-    commission_ht = prestations * Decimal("0.35") + frais_service
+    # 4) Calculs (ta logique actuelle)
+    prestations_ht = total_ht - frais_service_ht
+
+    commission_ht = (prestations_ht * Decimal("0.35")) + frais_service_ht
     tva_jsmv = commission_ht * Decimal("0.20")
 
     reversement_reparateur = total_ttc - (commission_ht + tva_jsmv)
-    ca_reparateur = prestations * Decimal("0.65")
+    ca_reparateur = prestations_ht * Decimal("0.65")
     tva_reparateur = ca_reparateur * Decimal("0.20")
 
     return {
-        "total_ht": float(round2(total_ht)),
-        "total_tva": float(round2(total_tva)),
-        "total_ttc": float(round2(total_ttc)),
-        "frais_service_ht": float(round2(frais_service)),
-        "prestations_ht": float(round2(prestations)),
-        "commission_ht": float(round2(commission_ht)),
-        "tva_jsmv": float(round2(tva_jsmv)),
-        "reversement_reparateur": float(round2(reversement_reparateur)),
-        "ca_reparateur": float(round2(ca_reparateur)),
-        "tva_reparateur": float(round2(tva_reparateur))
+        "ok": True,
+        "commande_id": commande_id,  # <-- AJOUT
+        "total_ht": float(total_ht),
+        "total_tva": float(total_tva),
+        "total_ttc": float(total_ttc),
+        "frais_service_ht": float(frais_service_ht),
+        "prestations_ht": float(prestations_ht),
+        "commission_ht": float(commission_ht),
+        "tva_jsmv": float(tva_jsmv),
+        "reversement_reparateur": float(reversement_reparateur),
+        "ca_reparateur": float(ca_reparateur),
+        "tva_reparateur": float(tva_reparateur),
+        "debug_excerpt": text[:2500],
     }
