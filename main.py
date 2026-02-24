@@ -24,8 +24,30 @@ def extract_commande_id(text: str) -> str | None:
     m = re.search(r"\b([A-Za-z]{3}-\d{5}-\d)\b", text)
     return m.group(1) if m else None
 
+from fastapi import FastAPI
+from pydantic import BaseModel
+import requests
+import io
+
+class ParseRequest(BaseModel):
+    file_id: str
+    file_name: str | None = None
+
 @app.post("/parse")
-async def parse_pdf(file: UploadFile = File(...)):
+async def parse_pdf(req: ParseRequest):
+
+    url = f"https://drive.google.com/uc?export=download&id={req.file_id}"
+
+    response = requests.get(url)
+    pdf_bytes = io.BytesIO(response.content)
+
+    with pdfplumber.open(pdf_bytes) as pdf:
+        parts = []
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            parts.append(t)
+
+    text = "\n".join(parts)
     # 1) Extraire le texte
     with pdfplumber.open(file.file) as pdf:
         parts = []
