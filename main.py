@@ -72,8 +72,9 @@ async def parse_pdf(file: UploadFile = File(...)):
     tva_reparateur = ca_reparateur * Decimal("0.20")
 
     return {
-        "ok": True,
-        "commande_id": commande_id,  # <-- AJOUT
+    "ok": True,
+    "parsed": {
+        "commande_id": commande_id,
         "total_ht": float(total_ht),
         "total_tva": float(total_tva),
         "total_ttc": float(total_ttc),
@@ -84,5 +85,5 @@ async def parse_pdf(file: UploadFile = File(...)):
         "reversement_reparateur": float(reversement_reparateur),
         "ca_reparateur": float(ca_reparateur),
         "tva_reparateur": float(tva_reparateur),
-        "debug_excerpt": text[:2500],
     }
+}
