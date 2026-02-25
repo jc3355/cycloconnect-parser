@@ -2,3 +2,4 @@ fastapi
 uvicorn
 pdfplumber
 python-multipart
+requests==2.32.3
